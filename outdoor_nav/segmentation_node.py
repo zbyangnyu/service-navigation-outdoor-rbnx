@@ -14,7 +14,8 @@ class SegmentationNode(Node):
     def __init__(self):
         super().__init__('road_segmentation')
         defaults={'rgb_topic':'/camera_gemini330/color/image_raw','mask_topic':'/semantic/road_mask',
-                  'overlay_topic':'/semantic/debug_overlay','config_json':'{}','max_image_age':1.0}
+                  'overlay_topic':'/semantic/debug_overlay','stairs_topic':'/semantic/stairs_mask',
+                  'config_json':'{}','max_image_age':1.0}
         for k,v in defaults.items(): self.declare_parameter(k,v)
         self.p={k:self.get_parameter(k).value for k in defaults}
         self.decoder=ImageDecoder()
@@ -24,6 +25,9 @@ class SegmentationNode(Node):
         self.pub=self.create_publisher(Image,self.p['mask_topic'],5)
         self.debug=self.create_publisher(Image,self.p['overlay_topic'],2)
         self.status=self.create_publisher(String,'/semantic/segmentation_status',5)
+        # Optional: backends declaring has_stairs expose last_stairs (bool HxW) after predict.
+        self.stairs_pub=(self.create_publisher(Image,self.p['stairs_topic'],5)
+                         if getattr(self.model,'has_stairs',False) else None)
         self.sub=self.create_subscription(Image,self.p['rgb_topic'],self.receive,
                                          rclpy.qos.QoSProfile(depth=1,reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT))
         self.frames=0
@@ -42,10 +46,16 @@ class SegmentationNode(Node):
             debug = rgb.copy()
             road = mask == 1
             debug[road] = (debug[road].astype(float)*.55 + np.array([0,255,0])*.45).astype(np.uint8)
+            extra={}
+            if self.stairs_pub is not None:
+                stairs=np.asarray(self.model.last_stairs,bool)&(mask!=255)  # confident stair pixels; already nonroad
+                self.stairs_pub.publish(image_message(stairs.astype(np.uint8),msg.header,'mono8'))
+                debug[stairs]=(debug[stairs].astype(float)*.45+np.array([255,120,0])*.55).astype(np.uint8)
+                extra['stairs_pixels']=int(stairs.sum())
             self.debug.publish(image_message(debug,msg.header,'rgb8'))
             self.frames+=1
             self.status.publish(String(data=json.dumps({'ok':True,'backend':self.config['backend'],
-                      'frames':self.frames,'inference_seconds':elapsed,'road_pixels':int((mask==1).sum())})))
+                      'frames':self.frames,'inference_seconds':elapsed,'road_pixels':int((mask==1).sum()),**extra})))
         except Exception as exc:
             self.status.publish(String(data=json.dumps({'ok':False,'error':str(exc)})))
             self.get_logger().error(str(exc))

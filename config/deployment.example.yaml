@@ -32,6 +32,7 @@ service:
         # backend: outdoor_nav.segformer_backend:create_backend
         # weights: assets/segformer-b0-cityscapes
         # options: {input_scale: 1.0, road_class_ids: [0, 1]}
+        # Fine-tuned 4-class model (paved + stairs): options: {road_class_ids: [1], stairs_class_ids: [3]}
       policy:
         lidar_enabled: true
         camera_enabled: false

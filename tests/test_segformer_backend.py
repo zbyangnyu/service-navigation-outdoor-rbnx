@@ -50,15 +50,41 @@ def test_input_scale_and_threshold():
 
 
 def test_options_validation():
-    assert sb._options({}) == (1.0, [0, 1])
-    assert sb._options({'input_scale': .5, 'road_class_ids': [0]}) == (.5, [0])
-    for bad in ({'foo': 1}, {'input_scale': 0}, {'input_scale': True}, {'road_class_ids': []}, {'road_class_ids': [-1]}):
+    assert sb._options({}) == (1.0, [0, 1], [])
+    assert sb._options({'input_scale': .5, 'road_class_ids': [0]}) == (.5, [0], [])
+    assert sb._options({'road_class_ids': [1], 'stairs_class_ids': [3]}) == (1.0, [1], [3])
+    for bad in ({'foo': 1}, {'input_scale': 0}, {'input_scale': True}, {'road_class_ids': []}, {'road_class_ids': [-1]},
+                {'stairs_class_ids': 3}, {'stairs_class_ids': [0]}):
         with pytest.raises(ValueError):
             sb._options(bad)
     with pytest.raises(ValueError):
         sb.SegformerRoad(Fake(3), 'cpu', road_class_ids=[5])
     with pytest.raises(ValueError):
+        sb.SegformerRoad(Fake(3), 'cpu', road_class_ids=[1], stairs_class_ids=[3])
+    with pytest.raises(ValueError):
         sb.SegformerRoad(Fake(), 'cpu').predict(np.zeros((4, 4), np.uint8))
+
+
+def test_stairs_output():
+    """4-class fine-tuned layout: 1 paved = road, 3 stairs = nonroad + last_stairs."""
+    class Four(Fake):
+        def forward(self, pixel_values):
+            b, _, h, w = pixel_values.shape
+            y = torch.zeros(b, 4, h // 4, w // 4)
+            y[:, 1, :, : w // 8] = 10.   # paved on the left
+            y[:, 3, :, w // 8:] = 10.    # stairs on the right
+            return type('O', (), {'logits': y})()
+    rgb = np.zeros((64, 128, 3), np.uint8)
+    plain = sb.SegformerRoad(Four(4), 'cpu', road_class_ids=[1])
+    assert not plain.has_stairs
+    plain.predict(rgb)
+    assert plain.last_stairs is None
+    b = sb.SegformerRoad(Four(4), 'cpu', road_class_ids=[1], stairs_class_ids=[3])
+    assert b.has_stairs and b.last_stairs is None  # known before any image is run
+    mask, _ = b.predict(rgb)
+    assert b.last_stairs.shape == mask.shape and b.last_stairs.dtype == bool
+    assert mask[:, :20].all() and not mask[:, -20:].any()
+    assert b.last_stairs[:, -20:].all() and not b.last_stairs[:, :20].any()
 
 
 def test_config_accepts_model_directory(tmp_path: Path):

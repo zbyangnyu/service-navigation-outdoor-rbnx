@@ -100,7 +100,7 @@ properties:
       weights: {type: string, description: "Required when enabled; downloaded weights file or model directory, relative to deploy manifest directory."}
       device: {type: string, default: auto}
       confidence_threshold: {type: number, default: 0.7, minimum: 0, maximum: 1}
-      options: {type: object, additionalProperties: true, description: "Backend options. SegFormer: input_scale (default 1.0), road_class_ids (default [0, 1])."}
+      options: {type: object, additionalProperties: true, description: "Backend options. SegFormer: input_scale (default 1.0), road_class_ids (default [0, 1]), stairs_class_ids (default [], publishes /semantic/stairs_mask)."}
   policy:
     type: object
     x-group: Execution and observation

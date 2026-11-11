@@ -53,6 +53,21 @@ semantic_segmentation:
 下载 [nvidia/segformer-b0-finetuned-cityscapes-1024-1024](https://huggingface.co/nvidia/segformer-b0-finetuned-cityscapes-1024-1024) 到本地目录（如 `huggingface-cli download nvidia/segformer-b0-finetuned-cityscapes-1024-1024 --local-dir assets/segformer-b0-cityscapes`），`weights` 指向该目录。运行时只读本地文件，不联网。
 选项：`input_scale`（默认 1.0，推理前缩放，结果仍恢复原尺寸）、`road_class_ids`（默认 `[0, 1]`）。置信度为 softmax 最大概率，低于 `confidence_threshold` 的像素记为未知。
 
+#### 可选：微调 4 类模型（路面 + 楼梯）
+
+在 SegFormer-B0 ADE20K 基础上用 ADE20K + 山猫实拍伪标签微调，类别为 `0 其他、1 硬质路面、2 草地泥土、3 楼梯`。山猫留出的 40 张图前方路面 100%、楼梯误报 0；ADE20K 楼梯 IoU 0.39（原 B0 ADE20K 为 0.19）。往下看的楼梯（下楼）仍不可靠，下楼请依赖深度/激光雷达。
+权重不随仓库发布（基础权重为 NVIDIA 非商用许可），请向维护者索取模型目录后配置：
+
+```yaml
+    backend: outdoor_nav.segformer_backend:create_backend
+    weights: assets/segformer-b0-lynx-ft
+    options:
+      road_class_ids: [1]   # 只有硬质路面算路
+      stairs_class_ids: [3] # 楼梯：本身就算非路面，另外发布 /semantic/stairs_mask
+```
+
+设置 `stairs_class_ids` 后，节点额外发布 `/semantic/stairs_mask`（mono8，1 为置信度达标的楼梯像素），调试图中楼梯显示为橙色，状态消息带 `stairs_pixels`。
+
 PIDNet 示例：`backend: pidnet`、`weights: assets/PIDNet_M_Cityscapes_test.pt`、`options: {architecture: pidnet-m}`。
 
 ### 权重下载与可替换模型接口
