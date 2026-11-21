@@ -84,6 +84,7 @@ def test_real_sdk_driver_and_rpc_mcp_wire(monkeypatch):
         driver = rpc.RobonixServiceNavigationOutdoorDriverStub(channel)
         config = {
             "params_file": str(ROOT / "config/nav2_params.example.yml"),
+            "ground_height_file": str(ROOT / "tests/fixtures/ground.synthetic.json"),
             "topic_remap": {
                 "cloud": "/test/cloud",
                 "odom": "/test/rtk_imu_odom",
@@ -131,7 +132,8 @@ def test_real_sdk_driver_and_rpc_mcp_wire(monkeypatch):
         deferred = driver.Driver(
             lifecycle_pb2.Driver_Request(
                 command=0,
-                config_json=json.dumps({"params_file": config["params_file"]}),
+                config_json=json.dumps({"params_file": config["params_file"],
+                                       "ground_height_file": config["ground_height_file"]}),
             ),
             timeout=5,
         )

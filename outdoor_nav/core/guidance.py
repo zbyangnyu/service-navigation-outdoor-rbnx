@@ -38,6 +38,14 @@ def projection(point, points):
     return best
 
 
+
+def entered_next_segment(point, a, b, c):
+    """Recognize an ordered corner detour, without searching later road arms."""
+    current = projection(point, [a, b])
+    following = projection(point, [b, c])
+    return following["offset_m"] > 0 and following["distance_m"] < current["distance_m"]
+
+
 def validate_point(value):
     if not isinstance(value, dict) or not all(
         isinstance(value.get(k), (int, float))
@@ -216,7 +224,8 @@ class RouteGuidance:
             crossed = px * dx + py * dy >= 0
             length = math.hypot(dx, dy)
             lateral = abs(px * dy - py * dx) / length if length else distance(position, b)
-            if distance(position, b) > 0.6 and not (crossed and lateral <= 1.5):
+            turned = entered_next_segment(position, a, b, self.target(self.index + 1))
+            if distance(position, b) > 0.6 and not (crossed and lateral <= 1.5) and not turned:
                 break
             self.index += 1
         end, ahead = self.index, distance(position, self.target(self.index))

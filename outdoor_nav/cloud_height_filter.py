@@ -1,114 +1,86 @@
-"""Filter a point cloud by a distance-graded minimum height before scan projection."""
-
+"""Acquisition-time base-frame height envelope, then local terrain arbitration."""
+import copy
+import sys
 import numpy as np
 import rclpy
-from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.duration import Duration
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
 from tf2_ros import Buffer, TransformListener
-
+from .configuration import load_runtime
+from .terrain_inputs import TerrainInputs, rotation
+from .core.terrain_geometry import height_keep, suppress_stair_points
 from .core.height_filter import body_band, filter_xyz
 
 
-def rotation(transform):
-    q = transform.transform.rotation
-    x, y, z, w = q.x, q.y, q.z, q.w
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
+def apply(points, transform):
+    t = transform.transform.translation
+    return points @ rotation(transform.transform.rotation).T + np.array([t.x, t.y, t.z])
 
 
 class CloudHeightFilter(Node):
-    def __init__(self):
-        super().__init__("outdoor_cloud_height_filter")
-        self.near = float(self.declare_parameter("near_m", 0.2).value)
-        self.far = float(self.declare_parameter("far_m", 0.5).value)
-        self.ramp = float(self.declare_parameter("ramp_m", 8.0).value)
-        self.ceiling = float(self.declare_parameter("max_m", 0.7).value)
-        self.lidar_height = float(self.declare_parameter("lidar_height_m", 0.42).value)
-        if not (0 <= self.near <= self.far < self.ceiling
-                and self.ramp > 0 and self.lidar_height > 0):
-            raise ValueError("Invalid graded height parameters")
-        # A ceiling below the far threshold would delete every far point,
-        # including real obstacles, so keep a thin band above either value.
-        requested = self.ceiling
-        self.ceiling = max(self.ceiling, self.far + 0.2)
-        if self.ceiling != requested:
-            self.get_logger().warn(
-                "cloud_max_height_m %.2f is below the far height threshold; "
-                "using %.2f for far points" % (requested, self.ceiling)
-            )
-        self.buffer = Buffer(cache_time=Duration(seconds=2.0))
-        self.listener = TransformListener(self.buffer, self)
-        self.publisher = self.create_publisher(PointCloud2, "/outdoor/cloud_for_scan", 10)
-        self.create_subscription(PointCloud2, "cloud_in", self.receive, qos_profile_sensor_data)
+    def __init__(self, runtime):
+        super().__init__('outdoor_cloud_height_filter')
+        self.p, self.projection = runtime['terrain'], runtime['scan_projection']
+        self.policy = runtime['policy']
+        self.tf = Buffer()
+        self.listener = TransformListener(self.tf, self)
+        self.inputs = TerrainInputs(self, runtime) if self.p['enabled'] else None
+        self.timeout = runtime['policy']['sensor_timeout_s']
+        self.pub = self.create_publisher(PointCloud2, runtime['topic_remap']['filtered_cloud'], 10)
+        self.create_subscription(PointCloud2, runtime['topic_remap']['cloud'], self.receive, qos_profile_sensor_data)
 
     def receive(self, msg):
-        offsets, datatypes = {}, {}
-        for field in msg.fields:
-            if field.name in ("x", "y", "z"):
-                offsets[field.name], datatypes[field.name] = field.offset, field.datatype
-        if len(offsets) != 3 or msg.is_bigendian:
-            return
-        if any(kind != PointField.FLOAT32 for kind in datatypes.values()):
-            return
-        count = msg.width * msg.height
-        if count == 0 or msg.point_step <= 0 or len(msg.data) < count * msg.point_step:
-            return
-        raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(count, msg.point_step)
-        xyz = np.stack([
-            raw[:, offsets[name]:offsets[name] + 4].copy().view(np.float32).reshape(-1)
-            for name in ("x", "y", "z")
-        ])
-        frame = msg.header.frame_id or "base_link"
-        if frame != "base_link":
-            try:
-                transform = self.buffer.lookup_transform(
-                    "base_link", frame, msg.header.stamp, timeout=Duration(seconds=0.05)
-                )
-            except Exception:
-                return  # No live transform: leave the scan stale rather than trust raw axes.
-            xyz = rotation(transform) @ xyz + np.array([
-                transform.transform.translation.x,
-                transform.transform.translation.y,
-                transform.transform.translation.z,
-            ])[:, None]
-        near, far, ceiling = body_band(
-            self.near, self.far, self.ceiling, self.lidar_height
-        )
-        keep = filter_xyz(xyz[0], xyz[1], xyz[2], near, far, self.ramp, ceiling)
-        out = PointCloud2()
-        out.header = msg.header
-        out.header.frame_id = "base_link"
-        out.height = 1
-        out.width = int(keep.sum())
-        out.fields = msg.fields
-        out.is_bigendian = False
-        out.point_step = msg.point_step
-        out.row_step = out.width * msg.point_step
-        out.is_dense = msg.is_dense
-        data = raw[keep].copy()
-        for name, values in zip(("x", "y", "z"), xyz):
-            offset = offsets[name]
-            data[:, offset:offset + 4] = (
-                values[keep].astype(np.float32).view(np.uint8).reshape(-1, 4)
-            )
-        out.data = data.tobytes()
-        self.publisher.publish(out)
+        try:
+            stamp = msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
+            if not msg.header.frame_id or not 0 < stamp <= self.get_clock().now().nanoseconds/1e9 or self.get_clock().now().nanoseconds/1e9-stamp >= self.timeout:
+                return
+            values = point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+            points = np.column_stack([values[n] for n in ('x', 'y', 'z')]).reshape(-1, 3)
+            if not len(points):
+                return  # Empty raw input cannot certify free space.
+            if msg.header.frame_id != 'base_link':
+                tf = self.tf.lookup_transform('base_link', msg.header.frame_id, Time.from_msg(msg.header.stamp), timeout=Duration(seconds=.05))
+                points = apply(points, tf)
+            if self.p['slope_filter_enabled'] and self.p['lidar_slope_enabled']:
+                keep = height_keep(points, self.p)
+            elif self.projection.get('fixed_height', False):
+                keep = (np.isfinite(points).all(axis=1)
+                        & (points[:, 2] >= self.projection['min_height_m'])
+                        & (points[:, 2] <= self.projection['max_height_m']))
+            else:
+                p = self.policy
+                ceiling = max(p['cloud_max_height_m'], p['cloud_min_height_far_m'] + .2)
+                near, far, ceiling = body_band(p['cloud_min_height_near_m'],
+                    p['cloud_min_height_far_m'], ceiling, -self.p['ground_z_m'])
+                keep = filter_xyz(*points.T, near, far, p['cloud_height_ramp_m'], ceiling)
+            points = points[keep]
+            if self.inputs and len(points):
+                obs, state = self.inputs.suppression_context()
+                if obs and state.get('phase') == 'climb':
+                    tf = self.tf.lookup_transform('odom', 'base_link', Time.from_msg(msg.header.stamp), timeout=Duration(seconds=.05))
+                    remove = suppress_stair_points(apply(points, tf), obs, state, 'lidar_obstacles', self.p)
+                    points = points[~remove]
+            header = copy.deepcopy(msg.header)
+            header.frame_id = 'base_link'
+            self.pub.publish(point_cloud2.create_cloud_xyz32(header, points.astype(np.float32)))
+        except Exception as exc:
+            self.get_logger().warning('Cloud terrain filter: ' + str(exc), throttle_duration_sec=5.)
 
 
 def main():
-    rclpy.init()
-    node = CloudHeightFilter()
+    runtime = load_runtime(sys.argv[1])
+    rclpy.init(args=sys.argv[2:])
+    node = CloudHeightFilter(runtime)
     try:
         rclpy.spin(node)
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

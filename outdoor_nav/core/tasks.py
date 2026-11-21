@@ -40,6 +40,11 @@ class Task:
     origin_wgs84: dict | None = None
     intervals: list = field(default_factory=list)
     gait_status: dict | None = None
+    terrain_status: dict | None = None
+    reference_point: str = "gnss_antenna"
+    execution_frame: str = "map"
+    hint_index: int | None = None
+    hint_count: int | None = None
 
 
 class TaskStore:

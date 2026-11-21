@@ -1,5 +1,124 @@
 # Outdoor navigation service for Robonix
 
+执行与恢复的职责、模式组合和时间预算见 [执行架构](docs/EXECUTION.md)。本分支已合并 main `fe738b6` 的修复；底盘准备、步态确认与速度放行分开，不再需要关闭底盘检查来启动任务。
+
+此视觉版本位于 `feat/vision-multisensor-navigation` 分支，包含原 RGB-D / RTAB-Map / 可选语义分割 链路及检测后稳定性过滤。现有使用者可继续使用 `main`；采用视觉版本时，在部署 manifest 中显式选择此分支，并按下文安装视觉依赖、配置完整 Nav2 参数。
+
+## 必填本机地面基准
+
+`ground_height_file` 必须指向本机 JSON 文件，内容至少包含 `ground_z_m`（地面在 base_link 下的有限负数）。无默认值，缺失、空值、布尔值、非有限值均拒绝初始化。复制 `config/ground.local.example.json` 后填入实测值，实际文件 `config/ground.local.json` 由 Git 忽略；不要把标定数值写进跟踪的部署清单。
+
+读取后统一派生 `terrain.ground_z_m` 和 `policy.camera_expected_ground_z_m`，不再允许两处独立内联配置。修改本机文件后须重新初始化/重启服务，不会在运动中热换基准。
+
+## 部署参数约定
+
+完整 Nav2 参数由机器人部署的 `params_file` 拥有，服务只绑定话题占位符并裁剪关闭的传感器层，
+不再用启动代码覆盖速度、足迹、膨胀、地图尺寸或插入控制器。
+雷达投影放在 `scan_projection`，原视觉检测/稳定过滤及执行确认项保留在 `policy`。
+字段、单位和旧配置迁移见 [配置说明](docs/CONFIGURATION.md) 与 `config.spec`。
+实际生效配置写入运行目录的 `effective_nav2.yaml`。
+
+可选的 [周期式方向引导](docs/DECISION_CYCLE.md) 保留密集地图点，按至少 6 米及显著拐角生成提示队列。规划器使用周期障碍快照，控制器使用实时局部代价图，正常刷新期间可继续执行当前路径。该模式默认关闭。
+
+## 原视觉链路与检测后过滤
+
+相机链路先检查配准 RGB/深度/CameraInfo，再做地面参考估计和正负障碍复核。
+`policy.camera_geometry_backend` 显式选择 `legacy`（进程内几何，默认）或 `rtabmap`（法向量/聚类适配器）。
+两者均输出 visual_obstacles + observed_ground + depth_status；缺失有效地面观测不会用固定平面冒充检测通过。
+可替换语义模型 -> 完整类别图和置信度；按配置生成道路掩码 -> 原语义投影，作为辅助偏好。
+原检测源码按文件保留在 vendor/，没有使用先前的固定高度裁切替代检测器。
+
+新增过滤只位于原检测输出之后。先按同一采集时刻配对障碍、地面和有效状态，
+再在连续 odom 中按位置关联、累计命中/持续时间筛选稳定正障碍；
+已测得的负障碍直接保留。重复帧不累计，失效证书立即撤销相机就绪并清空本层图。
+地面覆盖继续使用原 observed_ground_region，四个角都需接近实际地面点；
+不以激光式射线或未知深度制造地面自由空间。
+
+语义分割仍只在几何已知自由区域叠加非道路软代价 40，不覆盖物理障碍或未知。
+相机本层使用原 build_costmap，再由随包编译的 CameraLayer 与雷达独立层取最大值合并；
+未知相机单元不修改雷达，旧相机标记在本帧/超时后退休。最后由 Nav2 统一执行规划控制。
+
+`policy.lidar_enabled` / `camera_enabled` 选择雷达、相机或两者。相机几何检测与可选语义分割独立，默认 `semantic_segmentation.enabled: false`，无需语义模型权重或 PyTorch。
+
+`policy.camera_geometry_enabled` 默认 `true`。相机启用时至少开启几何检测或 `semantic_segmentation.enabled` 之一。只开语义时，根据实时配准深度投影，`road_classes` 对应地面记为自由，其他已分类地面附加软代价 40，未知保持未知。此模式不提供几何障碍或落差检测，只有有效、含已分类地面的投影才能更新相机健康状态。
+
+`policy.camera_blind_zone_m` 指以 `base_link` 为原点、沿车头方向的半圆半径，单位米。默认 `0.0`，不额外声明盲区。设置为正数后，只把这个半圆中的未知相机格标为可通行，保留几何障碍、已知软代价和独立雷达层。相机链路无有效数据时，不会单靠盲区生成健康信号。
+启用语义分割必须先下载对应模型权重，再设置 `semantic_segmentation.weights`；仓库不附带权重，不自动下载。缺失权重在初始化时报错并提示本文。相对路径以部署 manifest 所在目录为基准。
+
+```yaml
+policy:
+  lidar_enabled: true
+  camera_enabled: true
+  camera_frame_confirmed: false # 必须实测确认配准和外参
+semantic_segmentation:
+  enabled: false
+  backend: "" # 安装适配器后填写 your_package.model:create_backend
+  weights: "" # 权重文件或目录；格式由适配器检查
+  device: auto
+  confidence_threshold: 0.7
+  classes: {} # 模型原始类别编号 -> 类别名称
+  road_classes: [] # classes 中参与道路软代价的类别名称
+  options: {} # 原样传给适配器的模型专用配置
+```
+
+### 可替换模型接口与权重
+
+当前默认模型、权重和类别表暂时留空，不附带或自动下载任何模型。
+开启时缺少适配器、权重路径或类别表会报错，并提示本文；关闭时不导入模型依赖。
+模型的来源、权重下载地址和许可由所选适配器提供，不沿用旧模型的许可结论。
+
+通用接口位于 `outdoor_nav/segmentation.py`。`backend` 只接受 `模块:工厂函数`，
+模块需安装到导航 worker 使用的 Python 环境。工厂签名为
+`create_backend(*, weights, device, options)`，返回具有 `predict(rgb)` 方法的对象。
+`weights` 支持文件或目录；通用层只检查路径存在且为文件/目录，文件格式、目录完整性和模型兼容性由适配器检查。
+
+- 输入：原尺寸 `H×W×3`、`uint8`、RGB 图像；核心不固定输入尺寸或预处理方法。
+- 返回 `(labels, confidence)`：均为原尺寸 `H×W`，适配器负责恢复缩放、裁剪后的像素对应关系。
+- `labels`：整数类别编号 `0..65534`，`65535` 保留为未知。编号与含义由 `classes` 明确配置；未声明或低置信度像素变为未知。
+- `confidence`：`float32/float64`，有限概率 `[0,1]`；非法输出、过期帧和像素尺寸不一致均拒绝。
+- 例如某模型输出 `{7: road, 12: slope, 23: stairs}`，可以配置 `road_classes: [road]`。编号仅为接口示例，不是任何默认模型的类别表。
+- 更换模型只需更换适配器、权重、类别表及 `options`；不修改几何检测、时间稳定过滤或 costmap 合并代码。
+
+以下均为包内部 ROS 2 话题，可通过 `topic_remap` 配置，不新增对外 Robonix 能力约定：
+
+| 参数 | 默认话题 | 消息 |
+| --- | --- | --- |
+| `camera_labels` | `/outdoor/vision/semantic_labels` | `sensor_msgs/Image`, `mono16`，保留完整类别 |
+| `camera_confidence` | `/outdoor/vision/semantic_confidence` | `sensor_msgs/Image`, `32FC1` |
+| `camera_road_mask` | `/outdoor/vision/road_mask` | `sensor_msgs/Image`, `mono8`：0 非道路、1 道路、255 未知 |
+| `camera_segmentation_status` | `/semantic/segmentation_status` | `std_msgs/String` JSON，包含类别表、未知编号、源时间戳、状态 |
+| `camera_overlay` | `/semantic/debug_overlay` | `sensor_msgs/Image`, `rgb8` |
+
+三张输出图像保留原 RGB 的时间戳和坐标系。斜坡、楼梯等类别不会被压成道路后丢失，
+但当前完整类别图只提供识别结果；本轮未实现基于三维坡度、阶高和底盘能力的可通行判定。
+`road_classes` 仅影响几何已知地面的软代价，不能清除相机或雷达障碍，也不触发步态切换。
+推理故障或过期结果按原有语义时效退出，几何链路继续工作；关闭语义时不启动推理和投影。
+
+旧 PIDNet 专用配置和内置模型加载分支已移除，历史源码与验证材料归档到忽略的 `local_only/legacy_pidnet/`。
+
+### 可选 SegFormer 适配器
+
+设置 `backend: outdoor_nav.segformer_backend:create_backend`，并在导航 worker 的 Python 环境中安装本包的 `[segformer]` 可选依赖（例如 `python -m pip install '.[segformer]'`）。Jetson 应安装适配其 JetPack 的 PyTorch，再安装匹配的 Transformers；不启用此适配器时无需安装这些依赖。
+
+此适配器要求 `weights` 为本地 Hugging Face 模型目录，包含模型权重（如 `model.safetensors`）和 `config.json`。加载使用 `local_files_only=True`。
+
+有 `preprocessor_config.json` 时，`options: {}` 会使用该文件。如果原模型只包含权重和模型配置，可以在 `options.preprocessing` 中填写训练时的参数。该选项一旦设置，就完整使用这组参数。必须显式填写布尔值 `do_resize`、`do_rescale` 和 `do_normalize`。启用 resize 时填写 `size: {height: ..., width: ...}` 和 Pillow 的 `resample` 编号，启用 rescale 时填写 `rescale_factor`，启用 normalize 时填写 RGB 顺序的 `image_mean` 和 `image_std`。
+
+当前适配器要求预处理保留完整视野，裁剪或补边需要另外实现像素坐标恢复。推理 logits 恢复原图尺寸后计算 softmax，返回原始类别编号和对应最大概率。`do_reduce_labels` 用于训练标签处理，不对预测类别再次减一。
+
+根据所选权重的实际类别表填写 `classes` 和 `road_classes`，不要复制其他权重的编号。适配器不做二值化、不提供 `last_stairs`，所有类别走同一个输出接口。置信度是 softmax 分数，不等同于已校准的识别准确率。
+
+官方模型示例：[NVIDIA SegFormer B0 Cityscapes 权重与配置](https://huggingface.co/nvidia/segformer-b0-finetuned-cityscapes-1024-1024/tree/main)。该示例不保证识别楼梯或坡道，也不是本包默认模型；自定义地形模型仍需提供对应权重和类别表。使用前核对所选模型卡和权重许可；导航代码的许可不替代模型许可。预处理接口见 [Transformers SegFormer 文档](https://huggingface.co/docs/transformers/model_doc/segformer)。
+
+需安装原几何链路依赖 RTAB-Map、SciPy、Shapely 2、OpenCV、message_filters；模型运行依赖由适配器决定。
+build.sh 会编译相机适配插件，start.sh 会加载包内 overlay。
+相机原检测输出固定使用原 live-domain guard 所要求的 outdoor observation 端点。
+关闭的传感器不参与依赖发现和健康门控；定位包不增加视觉里程计。
+
+稳定性仍是可配置的时间/位置判据，不能保证识别所有运动物体；
+短暂停止、慢速运动、簇合并或遮挡可能误判。现场过滤阈值须验收。
+旧“高度裁切 + 二维扫描”方案和相应测试已撤下，不能再把其验证结果当作本链路验收。
+
 把 outdoorNav 的 **Nav2 执行与避障链**封装为 Robonix service，支持外部提供的整条参考路线，不重新实现道路业务规划。
 
 ```text
@@ -27,8 +146,8 @@
 - `outdoor_nav/runtime.py`、`executor.py`：唯一执行 owner、滚动窗口、停车确认和状态。
 - `outdoor_nav/guard.py`：独立速度/扫描/定位看门狗，保留原链路的失效归零。
 - `outdoor_nav/service.launch.py`：仅启动投影、执行器、守卫及 Nav2；不启动外部传感器与定位。
-- `tests/`：冻结算法对照、参数/请求/生命周期、Scene/gRPC 接入和隔离 Nav2 楼梯测试。
-- `docs/upstream-snapshot.json`：被提取源码的 SHA-256；`tests/upstream_executor.py.txt` 是只用于对比的冻结参照。
+- `docs/CONFIGURATION.md`、`docs/upstream-snapshot.json`：配置说明与源码来源记录。
+- `local_only/`：本地测试、验证报告、备份与机器专用配置，由 `.gitignore` 排除，不随仓库分发。
 
 参考服务结构：[syswonder/service-navigation-rbnx](https://github.com/syswonder/service-navigation-rbnx)。不直接复制其室内静态地图依赖、控制器插件、停止脚本或传感器默认参数。
 
@@ -44,7 +163,7 @@ bash scripts/build.sh
 
 启动解释器需安装 `robonix-api` 与本包 `[robonix]` 可选依赖，固定 `mcp>=1.27,<2.0.dev0` 和 `fastmcp>=3,<4`，避免 SDK 的 v1 FastMCP 接口被 mcp 2.x 替换；可用 `OUTDOOR_SERVICE_PYTHON` 指定 ROS-compatible Python/venv。
 
-构建只生成 gRPC/MCP bindings，**不生成 ROS IDL overlay**。将 `config/deployment.example.yaml` 条目复制到机器人部署仓库；将 `config/nav2_params.example.yml` 复制为部署侧 `config/outdoor_nav2.yaml` 并检查部署参数，再通过该部署 manifest 的 `rbnx build` / `rbnx boot` 启动。不要直接使用占位 provider 名称当作现成部署。
+构建生成 gRPC/MCP bindings 和相机 costmap 插件 overlay，**不生成 Robonix ROS IDL overlay**。将 `config/deployment.example.yaml` 条目复制到机器人部署仓库；将完整的 `config/nav2_params.example.yml` 复制为部署侧 `config/outdoor_nav2.yaml` 并检查部署参数，再通过该部署 manifest 的 `rbnx build` / `rbnx boot` 启动。不要直接使用占位 provider 名称当作现成部署。
 
 `start.sh` 只起 bridge；Driver INIT 才绑定依赖并起执行进程。外部反馈尚未就绪时不接受运动任务，activate 不能绕过健康门控。deactivate 与 stop 等待新鲜的速度反馈确认停车；服务停机只回收本实例进程组，不按通用 Nav2 进程名清理。
 
@@ -52,11 +171,13 @@ bash scripts/build.sh
 
 `params_file` 相对部署 manifest 所在目录解析。`policy` 保留原现场执行策略，确认项默认关闭，不能为让启动通过而随意设为 true。
 
+- `provider_ids.camera`：按相机包声明发现 RGB、深度、彩色 CameraInfo；配准深度 CameraInfo 仍通过 `topic_remap.camera_depth_info` 显式配置。关闭相机不发现这些输入。
 - `provider_ids.cloud`：提供 `robonix/primitive/lidar/lidar3d` 的前雷达。
 - `provider_ids.localization`：独立定位 service，同一实例提供 `robonix/service/localization/odom` 和 `.../status`；不将定位数据冒充底盘原语。`provider_ids.odom` 仍可单独指定 odom 角色。
 - `topic_remap`：显式话题绑定覆盖 Atlas；显式值覆盖 Atlas；未显式绑定的定位状态与 Odometry 来自所选 localization service。
 - `tf` / `tf_static`：已有 `map→odom→base_link` 动态树和传感器静态外参，服务不另造一套。
-- `global_grid`：`origin: [x,y]`、米制 `width/height`、`resolution`；只决定传感器地图范围，不是静态通行先验。
+- `scan_projection`：雷达投影高度、距离和 TF 容差；相机使用原检测链路。
+- 地图尺寸、足迹、分辨率及各层参数直接写在部署 Nav2 YAML 中；旧 `global_grid` 只做有警告的兼容迁移。
 - `velocity_output_topic`：默认为非运动 sink；接真实底盘属于后续部署步骤。
 
 ### 定位就绪 JSON
@@ -121,7 +242,7 @@ bash scripts/build.sh
 
 所有楼梯区段及上述缓冲使用 `StairsFollowPath` 沿参考线跟踪，暂停局部碰撞检查及 NavFn 绕行；平地切回原 DWB 和避障。需要安装 `nav2_regulated_pure_pursuit_controller`。保留急停、底盘状态、传感器新鲜度、定位断流及停车确认。默认到点容差仍为 3 米。
 
-只请求 gait，不调用 posture、站起或使用模式切换。外部姿态指令改变步态时会停车重新确认。1 米缓冲不保证覆盖定位误差；本轮未验证真实上下楼梯。隔离真实 Nav2 测试入口：`tests/stairs_smoke.py`（仅域 188，虚拟传感器及命令出口）。
+只请求 gait，不调用 posture、站起或使用模式切换。外部姿态指令改变步态时会停车重新确认。1 米缓冲不保证覆盖定位误差；本轮未验证真实上下楼梯。本地保留的隔离测试见 `local_only/README.md`。
 
 ## Scene 接入
 
@@ -129,14 +250,26 @@ Scene 使用本包的 `outdoor_nav.scene.SceneNavigation`，只接收当前建�
 
 导航请求记录最多保留 1024 个，每个最多 2 MiB；达到上限时拒绝新请求并提示归档，不静默删除幂等重试记录。旧网页地图/规划/障碍注入入口已从导航进程移除。
 
-## 测试
+## 本地验证材料
 
-```bash
-source /opt/ros/humble/setup.bash
-PYTHONPATH=. python3 -m pytest -q
-```
+回归测试位于已跟踪的 `tests/`；设备报告和运行产物可放在忽略的 `local_only/`，不作为克隆后才能测试的隐藏依赖。部署用配置示例保留在 `config/`；机器专用配置可放在 `local_only/config/`，并在部署中显式引用对应路径。
 
-独立回归不需要原工程或校园资源。`tests/test_scene.py` 与 `test_scene_wire.py` 验证新地图身份、步态区段、幂等重试和真实 gRPC；`tests/stairs_smoke.py` 在隔离域 188 使用真实 Nav2 和虚拟传感器验证空地图启动、步态确认、楼梯避障暂停/恢复及超时停车。历史算法冻结快照仅用于回归来源对照，不在运行路径中。
+## base_link 路线适配（本地修改）
+
+新录制配置 mapping `reference_point: base_link`、`localization_provider_id: localization_outdoor`，并提供与定位相同的 `origin_wgs84`。先启动定位，再启动建图。初始采集阶段定位 `require_map_reference: false`，不绑定旧地图 ID；实测标定和定位就绪条件仍必须满足。加载地图后仍须通过 Robonix/Scene 将地图 ID、版本和原点绑定给定位。
+
+mapping 消费已有 localization/status ROS 2 能力中的 pose 与 coordinate_reference，不重复补偿杆臂；原始 GNSS 消息继续保存。状态新增 pose_age_s、pose_stamp_s、status_stamp_s。pose_stamp_s 是定位进程单调时钟下的样本标识，仅用于顺序和去重；status_stamp_s 为 ROS 时钟，用于传输时效检查。需要同时更新定位和建图代码；旧定位缺少这些字段时不接受 base_link 录制。
+
+失效定位或原点不匹配时轨迹断段，重复样本不累计。录制、地图和规划结果持久化 reference_point，版本摘要包含该字段。旧数据缺少字段时按 gnss_antenna 解释，不能与 base_link 数据混录、合并或补采。恢复使用录制自身的原点与参考点。旧图精确转换需要历史同步姿态和实际杆臂，否则应重新录制。
+
+Navigation 和 Scene 仅对显式 base_link 路线解除零杆臂要求，仍检查原点、地图身份、零地图平移及实时 base_link 参考。不同机器人的杆臂无需相等。旧天线路线保持原有零杆臂兼容规则。
+
+本轮扩展已有 JSON 字段，不新增能力约定或改变 ROS 消息类型。仍是二维杆臂模型，尚未实现三维坡道补偿。本轮仅本地测试，未同步 ranger，未验证 ROS 整栈或真实底盘。
+
+
+地形状态机、四路优先级、共享坡度阈值与新参数见 [地形导航说明](docs/TERRAIN.md)。新状态机和高度阈值需显式开启；视觉前向距离默认 4 m，保留原有传感器独立开关。
+
+独立回归不需要原工程或校园资源。`tests/` 验证地图身份、步态区段、执行组合、幂等重试和真实 gRPC；OutdoorNav 的 `simulation` 负责隔离整栈模拟。
 
 ## 惯导连续定位
 
@@ -147,13 +280,13 @@ RTK 确认，等待上限沿用 navigation_recovery_timeout_s。定位误差超�
 状态透传 fusion，并提供 new_task_ready；惯性速度为估计值，不是独立停车传感器。
 
 
-定位消息、机器人位姿和 Nav2 各层坐标变换默认允许 3 秒数据龄期，分别由
-`localization_timeout_s`、`pose_timeout_s`、`transform_tolerance_s` 控制。
+定位消息、机器人位姿和速度共用 `localization_timeout_s`，默认 3 秒。
+`pose_timeout_s` 仅为兼容别名；障碍观测和执行命令保留各自较短的时效。Nav2 TF 容差属于部署 YAML。
 规划请求使用独立实际计时，等待数据恢复不占用请求的 10 秒预算；恢复仍受恢复等待上限控制。
 前端路线提供道路途经点，NavFn 根据障碍地图求可行路径，DWB 按路径计算实时速度。
 中间途经点规划失败且近期雷达回波和占用格共同确认其在障碍中时，可以尝试下一点；
 只有后续避障路径规划成功才记为跳过，最终目的地不会跳过。
 
 
-Scene 通过 `navigation_http_url` 转发 `/api/costmaps/{global|local}`，保留全局紫色、局部青色的已有配色。快照在其自身坐标系下提供机器人和执行路径；坐标变换超过 3 秒时隐藏对应叠加。
+代价地图快照和点云接口保留；Scene 的连接方式由 Scene 部署配置决定，不通过导航服务的构造参数指定 HTTP 地址。快照在其自身坐标系下提供机器人和执行路径，过期变换不用于叠加。
 定位状态的 `imu_stream` 原样传递，定位消息过期后置空；这些展示不增加停车条件。

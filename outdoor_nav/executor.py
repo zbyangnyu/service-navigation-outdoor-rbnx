@@ -149,10 +149,11 @@ class Executor(Node):
         try:
             task = self.tasks.snapshot() or {}
             points = task.get("execution_path") or []
-            if frame == "map":
+            path_frame = task.get("execution_frame", "map")
+            if frame == path_frame:
                 path = points
             elif points:
-                transform = self.tf.lookup_transform(frame, "map", rclpy.time.Time())
+                transform = self.tf.lookup_transform(frame, path_frame, rclpy.time.Time())
                 if not transform_fresh(transform):
                     raise ValueError('Path transform is stale')
                 t, angle = (
@@ -550,6 +551,7 @@ class Executor(Node):
         path.header.frame_id = "map"
         path.header.stamp = self.get_clock().now().to_msg()
         start = validate_point(position)
+        goal_tolerance = self.config.get("controller_goal_tolerance_m", 0.5)
         window = list(window)
         skipped = set()
         confirmed_skips = set()
@@ -585,7 +587,17 @@ class Executor(Node):
             if self.hardware and guidance.final_leg and len(leg) == 1:
                 # A coincident destination still needs a path for final heading alignment.
                 leg = [request.start, *leg]
-            if result.status != GoalStatus.STATUS_SUCCEEDED or len(leg) < 2:
+            usable = result.status == GoalStatus.STATUS_SUCCEEDED and len(leg) >= 2
+            if usable and index < len(guidance.points) - 1:
+                end = leg[-1].pose.position
+                # A temporary endpoint already inside the goal checker cannot
+                # advance the robot. Straight samples must also advance along
+                # their own ordered segment, even when shifted off the road.
+                inside_goal = math.hypot(end.x-position["x"], end.y-position["y"]) <= goal_tolerance
+                forward = ((end.x-start["x"])*(reference["x"]-previous["x"])
+                           + (end.y-start["y"])*(reference["y"]-previous["y"]))
+                usable = not inside_goal and (index in guidance.bends or forward > 0)
+            if not usable:
                 now_s = self.get_clock().now().nanoseconds / 1e9
                 if (index < len(guidance.points)-1
                         and self.scan is not None
@@ -613,6 +625,10 @@ class Executor(Node):
                         <= 4.1
                     ):
                         continue
+                self.planner_failure = (
+                    f"No advancing path at via {index} ({point['x']:.2f}, {point['y']:.2f}); "
+                    f"planner status {result.status}, {len(leg)} poses"
+                )
                 # An unreachable later station does not invalidate the part
                 # already planned. Follow it and retry from a closer position.
                 if not path.poses:
@@ -689,15 +705,16 @@ class Executor(Node):
             )
             started_sim = self.get_clock().now().nanoseconds / 1e9
             controller_used = None
-            recovery_used = getattr(self, "handled_recovery", 0)
+            recovery_used = (getattr(self, "handled_recovery", 0), getattr(self, "handled_epoch", None))
             while True:
                 if self.interrupted(task_id):
                     raise InterruptedError("Task canceled or superseded")
                 position = await self.wait_for_ready_pose(task_id)
-                recovery = getattr(self, "handled_recovery", 0)
+                recovery = (getattr(self, "handled_recovery", 0), getattr(self, "handled_epoch", None))
                 if recovery != recovery_used:
                     current_points, follow_result, sent_window = [], None, None
-                    guidance = RouteGuidance(route["reference_path"], position, goal_point)
+                    # Keep ordered route progress across a localization correction;
+                    # rebuilding from the original start would send the robot back.
                     budget = ProgressBudget(planner_patience_s=policy.get("planner_patience_s", 0.0),
                                             controller_patience_s=policy.get("controller_patience_s", 20.0))
                     recovery_used = recovery
@@ -753,7 +770,7 @@ class Executor(Node):
                     if not self.status(False)["ready"]:
                         raise RuntimeError("Localization or sensors lost at arrival")
                     stopped_pose = await self.wait_for_ready_pose(task_id)
-                    if self.hardware and getattr(self, "handled_recovery", 0) != recovery_used:
+                    if self.hardware and (getattr(self, "handled_recovery", 0), getattr(self, "handled_epoch", None)) != recovery_used:
                         continue
                     remaining = math.dist(
                         (stopped_pose["x"], stopped_pose["y"]),
@@ -802,7 +819,8 @@ class Executor(Node):
                     if len(points) < 2:
                         if not budget.planned(False, now):
                             raise RuntimeError(
-                                "No traversable path in the sensor costmap"
+                                "No traversable path in the sensor costmap: "
+                                + getattr(self, "planner_failure", "planner returned no path")
                             )
                         self.stopping = True
                         if not await self.release_controller(
@@ -815,7 +833,8 @@ class Executor(Node):
                         self.tasks.update(
                             task_id,
                             state="planning",
-                            reason="暂时无可行路径，停车等待并重规划",
+                            reason="暂时无可行路径，停车等待并重规划: "
+                                   + getattr(self, "planner_failure", "planner returned no path"),
                         )
                         await self.pause(0.5)
                         continue

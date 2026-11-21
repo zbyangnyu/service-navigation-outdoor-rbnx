@@ -176,6 +176,8 @@ def test_worker_stops_until_actual_feedback_and_controller_match(monkeypatch):
     velocities=[]
     node.command_pub=SimpleNamespace(publish=lambda msg:velocities.append(msg.linear.x))
     node.stopping = False
+    node.raw_command=SimpleNamespace(linear=SimpleNamespace(x=0.), angular=SimpleNamespace(z=0.))
+    node.raw_received=100.
     node.chassis = {"state":17,"gait":FLAT,"usage_mode":1,"motion_feedback_age_s":.01,
                     "usage_mode_age_s":.01,"gait_output_enabled":True}
     node.chassis_at = 100.
@@ -185,6 +187,7 @@ def test_worker_stops_until_actual_feedback_and_controller_match(monkeypatch):
     assert sent == [STAIRS] and velocities==[0.]
     assert not node.tasks.snapshot()["gait_status"]["confirmed"]
     node.controller_id=lambda:'StairsFollowPath'
+    node.gait_confirmed=lambda task: OutdoorExecutor.gait_confirmed(node, task)
     assert not OutdoorExecutor.motion_allowed(node,node.tasks.snapshot())
     node.chassis['gait']=STAIRS
     OutdoorExecutor.gait_tick(node)
@@ -207,3 +210,11 @@ def test_prepare_and_confirmation_have_separate_deadlines():
     waiting = GaitSchedule(REFERENCE, INTERVALS)
     tick(waiting, 5., 0., eligible=False)
     assert tick(waiting, 5., 15., eligible=False)[1]['reason'] == 'gait_prepare_timeout'
+
+
+def test_gait_progress_uses_the_same_corner_detour_as_route_guidance():
+    route = RouteStation([{'x':0.,'y':0.}, {'x':3.,'y':0.}, {'x':3.,'y':2.}, {'x':6.,'y':2.}])
+    for point in ({'x':2.6,'y':.23}, {'x':3.4,'y':.73}, {'x':3.76,'y':1.37},
+                  {'x':4.34,'y':1.93}, {'x':5.56,'y':2.}):
+        station = route.update(point)
+    assert station == pytest.approx(7.56)

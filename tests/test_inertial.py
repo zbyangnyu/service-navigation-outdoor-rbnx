@@ -81,3 +81,10 @@ def test_scene_localization_record_is_saved_and_rate_limited(nav):
     nav.status()
     assert len(path.read_text().splitlines()) == 2
     nav.localization_log.close()
+
+
+def test_reset_and_rtk_correction_share_the_same_invalidation_check():
+    from outdoor_nav.localization_policy import correction_pending
+    assert not correction_pending({'fusion': {'recovery_id': 2}, 'navigation_sample': {'epoch': 'a'}}, 2, 'a')
+    assert correction_pending({'fusion': {'recovery_id': 3}, 'navigation_sample': {'epoch': 'a'}}, 2, 'a')
+    assert correction_pending({'fusion': {'recovery_id': 2}, 'navigation_sample': {'epoch': 'b'}}, 2, 'a')

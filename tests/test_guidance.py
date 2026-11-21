@@ -1,3 +1,4 @@
+import pytest
 from outdoor_nav.core.guidance import RouteGuidance
 from outdoor_nav.core.tasks import ProgressBudget
 from outdoor_nav.core.scan_health import healthy_scan
@@ -155,6 +156,26 @@ def test_failed_occupied_bend_skips_only_after_next_path_succeeds():
         assert path is None and not g.skipped
 
 
+def test_obstacle_detour_does_not_require_touching_the_bend():
+    reference = [{'x':0.,'y':0.}, {'x':3.,'y':0.}, {'x':3.,'y':2.}, {'x':6.,'y':2.}]
+    guidance = RouteGuidance(reference, reference[0], reference[-1])
+    for point in ({'x':2.6,'y':.23}, {'x':3.4,'y':.73}, {'x':3.76,'y':1.37},
+                  {'x':4.34,'y':1.93}, {'x':5.56,'y':2.}):
+        guidance.window(point)
+    assert guidance.final_leg
+    assert guidance.remaining_length(point) == pytest.approx(.44)
+
+
+def test_long_route_uses_a_local_horizon_not_the_distant_final_goal():
+    start = {'x':0., 'y':0.}
+    goal = {'x':107., 'y':47.}
+    guidance = RouteGuidance([start, {'x':107., 'y':0.}, goal], start, goal)
+    window = guidance.window(start)
+    assert not guidance.final_leg
+    assert all(math.hypot(guidance.points[i]['x'], guidance.points[i]['y']) <= 6.01 for i in window)
+    assert guidance.remaining_length(start) == pytest.approx(154.)
+
+
 def test_guided_path_bypasses_straight_samples_and_retries_when_needed():
     import asyncio
     from functools import partial
@@ -164,15 +185,16 @@ def test_guided_path_bypasses_straight_samples_and_retries_when_needed():
     guidance = RouteGuidance([], start, end)
     calls = []
 
-    def run(failed_calls):
+    def run(failed_calls, short_station=False):
         calls.clear()
 
         def send(request):
             point = request.goal.pose.position
             calls.append(point.x)
             success = len(calls) not in failed_calls
+            end_x = -0.15 if short_station and point.x == 2. else point.x
             result = S(status=4 if success else 6, result=S(path=S(
-                poses=[request.start, pose(point.x, point.y)] if success else []
+                poses=[request.start, pose(end_x, point.y)] if success else []
             )))
             return S(accepted=True, get_result_async=lambda: result)
 
@@ -180,7 +202,7 @@ def test_guided_path_bypasses_straight_samples_and_retries_when_needed():
             return value
 
         node = S(
-            hardware=False, global_map=None, scan=None, result=result,
+            hardware=False, config={}, global_map=None, scan=None, result=result,
             path_client=S(send_goal_async=send),
             get_clock=lambda: S(now=lambda: S(to_msg=lambda: None, nanoseconds=0)),
         )
@@ -193,6 +215,10 @@ def test_guided_path_bypasses_straight_samples_and_retries_when_needed():
     assert calls == [6., 2., 4., 6.]
     assert guidance.points[-1] == end
     assert not guidance.skipped
+    assert run({1, 3}, short_station=True) is None
+    assert calls == [6., 2., 4.]
+    assert run({1}, short_station=True).poses[-1].pose.position.x == 6.
+    assert calls == [6., 2., 4., 6.]
 
 
 def test_progress_advances_at_the_adjusted_station():

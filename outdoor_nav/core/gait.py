@@ -3,18 +3,29 @@
 from copy import deepcopy
 import math
 
-from .guidance import distance, projection
+from .guidance import distance, projection, entered_next_segment
 
 FLAT = 0x3002
 STAIRS = 0x3003
 RAW_GAITS = {"flat": (0x1001, FLAT), "stairs": (0x1003, STAIRS)}
 
 
+
+def chassis_prepared(body, received_age):
+    """Mode and feedback permit a gait request; actual gait gates velocity later."""
+    ages = ((received_age, 1.), (body.get("motion_feedback_age_s"), 1.),
+            (body.get("usage_mode_age_s"), 3.))
+    return (body.get("state") == 17 and body.get("usage_mode") == 1
+            and body.get("gait_output_enabled") is True
+            and all(type(age) in (int, float) and math.isfinite(age) and 0 <= age < limit
+                    for age, limit in ages))
+
+
 def route_length(reference):
     return sum(distance(a, b) for a, b in zip(reference, reference[1:]))
 
 
-def validate_intervals(reference, intervals):
+def validate_intervals(reference, intervals, *, check_codes=True):
     if not isinstance(intervals, list) or len(intervals) > 8192:
         raise ValueError("intervals must be a bounded list")
     total, previous, result = route_length(reference), 0.0, []
@@ -31,9 +42,9 @@ def validate_intervals(reference, intervals):
             raise ValueError("Unknown gait annotation")
         if code is not None and (type(code) is not int or not 0 <= code <= 0xffffffff):
             raise ValueError("Invalid actual gait code")
-        if gait in RAW_GAITS and code not in RAW_GAITS[gait]:
+        if check_codes and gait in RAW_GAITS and code not in RAW_GAITS[gait]:
             raise ValueError("Gait label and recorded code disagree")
-        if gait == "unknown" and any(code in codes for codes in RAW_GAITS.values()):
+        if check_codes and gait == "unknown" and any(code in codes for codes in RAW_GAITS.values()):
             raise ValueError("Known gait code cannot be labelled unknown")
         previous = b
         result.append({**deepcopy(raw), "start_m": float(a), "end_m": float(b)})
@@ -60,11 +71,9 @@ class RouteStation:
             px, py = point["x"] - b["x"], point["y"] - b["y"]
             crossed = px * dx + py * dy >= 0
             lateral = abs(px * dy - py * dx) / math.hypot(dx, dy)
-            current = projection(point, [a, b])
-            following = projection(point, [b, c])
-            # A controller rounds corners; it need not pass through the vertex.
-            turning = (distance(point, b) <= 0.75
-                       and following["distance_m"] < current["distance_m"])
+            # Use the planner's ordered corner rule; a valid obstacle detour
+            # must not leave gait progress stuck at the previous bend.
+            turning = entered_next_segment(point, a, b, c)
             if not ((crossed and lateral <= 1.5) or turning):
                 break
             self.index += 1
@@ -74,8 +83,9 @@ class RouteStation:
 
 
 class GaitSchedule:
-    def __init__(self, reference, intervals):
-        self.intervals = validate_intervals(reference, intervals)
+    def __init__(self, reference, intervals, *, flat_only=False):
+        self.flat_only = flat_only
+        self.intervals = validate_intervals(reference, intervals, check_codes=not flat_only)
         self.route = RouteStation(reference)
         self.stairs = []
         total = route_length(reference)
@@ -99,6 +109,8 @@ class GaitSchedule:
         self.rotation_since = None
 
     def desired(self, station):
+        if self.flat_only:
+            return FLAT
         if any(a <= station < b or (station == b == self.route.offsets[-1])
                for a, b in self.stairs):
             return STAIRS
